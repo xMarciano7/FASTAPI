@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 import whisper
 
 # ---------------- CONFIG ----------------
+print("### THIS IS THE NEW MAIN.PY ###")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
