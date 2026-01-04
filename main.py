@@ -52,29 +52,35 @@ def write_progress(job_id: str, percent: int):
 
 def runpod_transcribe(audio_path: str) -> str:
     import base64
+    import time
 
     with open(audio_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    payload = {
-        "input": {
-            "audio": audio_b64
-        }
-    }
-
-    r = requests.post(RUNPOD_URL, headers=RUNPOD_HEADERS, json=payload, timeout=600)
+    # 1) lanzar job
+    r = requests.post(
+        f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run",
+        headers=RUNPOD_HEADERS,
+        json={"input": {"audio": audio_b64}},
+        timeout=30
+    )
     r.raise_for_status()
+    job_id = r.json()["id"]
 
-    data = r.json()
+    # 2) polling
+    status_url = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{job_id}"
 
-    if "error" in data:
-        raise RuntimeError(str(data["error"]))
+    while True:
+        s = requests.get(status_url, headers=RUNPOD_HEADERS, timeout=30).json()
 
-    output = data.get("output")
-    if not output or "text" not in output:
-        raise RuntimeError("Respuesta inválida de RunPod")
+        if s["status"] == "COMPLETED":
+            return s["output"]["text"]
 
-    return output["text"]
+        if s["status"] == "FAILED":
+            raise RuntimeError("RunPod FAILED")
+
+        time.sleep(1)
+
 
 
 
