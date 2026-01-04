@@ -28,7 +28,7 @@ RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT_ID:
     raise RuntimeError("RUNPOD_API_KEY o RUNPOD_ENDPOINT_ID no definidos")
 
-RUNPOD_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run"
+RUNPOD_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync"
 RUNPOD_HEADERS = {
     "Authorization": f"Bearer {RUNPOD_API_KEY}",
     "Content-Type": "application/json",
@@ -52,35 +52,30 @@ def write_progress(job_id: str, percent: int):
 
 def runpod_transcribe(audio_path: str) -> str:
     import base64
-    import time
 
     with open(audio_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    # 1) lanzar job
+    payload = {
+        "input": {
+            "audio": audio_b64
+        }
+    }
+
     r = requests.post(
-        f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run",
+        RUNPOD_URL,
         headers=RUNPOD_HEADERS,
-        json={"input": {"audio": audio_b64}},
-        timeout=30
+        json=payload,
+        timeout=600
     )
     r.raise_for_status()
-    job_id = r.json()["id"]
 
-    # 2) polling
-    status_url = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{job_id}"
+    data = r.json()
 
-    while True:
-        s = requests.get(status_url, headers=RUNPOD_HEADERS, timeout=30).json()
+    if "output" not in data or "text" not in data["output"]:
+        raise RuntimeError(f"RunPod response inválida: {data}")
 
-        if s["status"] == "COMPLETED":
-            return s["output"]["text"]
-
-        if s["status"] == "FAILED":
-            raise RuntimeError("RunPod FAILED")
-
-        time.sleep(1)
-
+    return data["output"]["text"]
 
 
 
