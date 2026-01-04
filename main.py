@@ -51,17 +51,14 @@ def write_progress(job_id: str, percent: int):
 
 
 def runpod_transcribe(audio_path: str) -> str:
-    """
-    Envía el audio a RunPod Whisper y devuelve el texto.
-    """
+    import base64
+
     with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     payload = {
         "input": {
-            "audio": audio_bytes.hex(),
-            "task": "transcribe",
-            "language": "auto"
+            "audio": audio_b64
         }
     }
 
@@ -74,10 +71,11 @@ def runpod_transcribe(audio_path: str) -> str:
         raise RuntimeError(str(data["error"]))
 
     output = data.get("output")
-    if not output:
-        raise RuntimeError("Respuesta vacía de RunPod")
+    if not output or "text" not in output:
+        raise RuntimeError("Respuesta inválida de RunPod")
 
-    return output.get("text", "")
+    return output["text"]
+
 
 
 # ============================================================
