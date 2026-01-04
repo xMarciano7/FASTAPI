@@ -1,82 +1,135 @@
 import os
 import uuid
-import json
+import shutil
 import threading
 import subprocess
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
+import whisper
+
+# ---------------- CONFIG ----------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+STORAGE_INPUT = os.path.join(BASE_DIR, "storage", "input")
+STORAGE_TMP = os.path.join(BASE_DIR, "storage", "tmp")
+STORAGE_OUTPUT = os.path.join(BASE_DIR, "storage", "output")
+
+os.makedirs(STORAGE_INPUT, exist_ok=True)
+os.makedirs(STORAGE_TMP, exist_ok=True)
+os.makedirs(STORAGE_OUTPUT, exist_ok=True)
+
+# ---------------- APP ----------------
 
 app = FastAPI()
 
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://yjcuza-my-site-teyd1jsn-othmanebenbrahim12.wix-vibe.com"],  # o el dominio de tu web
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STORAGE = os.path.join(BASE_DIR, "storage")
-INPUT = os.path.join(STORAGE, "input")
-TMP = os.path.join(STORAGE, "tmp")
-OUTPUT = os.path.join(STORAGE, "output")
-
-os.makedirs(INPUT, exist_ok=True)
-os.makedirs(TMP, exist_ok=True)
-os.makedirs(OUTPUT, exist_ok=True)
+# ---------------- STATE ----------------
 
 jobs = {}
-presets = {}
 
-# ---------- PRESET (NUEVO) ----------
-@app.post("/preset")
-async def save_preset(preset: dict):
-    preset_id = str(uuid.uuid4())
-    presets[preset_id] = preset
-    return {"preset_id": preset_id}
+# ---------------- WHISPER (GLOBAL) ----------------
+# IMPORTANTE: cargar UNA sola vez
+whisper_model = whisper.load_model("base")
 
-# ---------- UPLOAD ----------
+# ---------------- WORKER ----------------
+
+def process_job(job_id: str, input_path: str):
+    try:
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["percent"] = 5
+
+        wav_path = os.path.join(STORAGE_TMP, f"{job_id}.wav")
+
+        # 1️⃣ Extraer audio
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_path,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                wav_path,
+            ],
+            check=True,
+        )
+
+        jobs[job_id]["percent"] = 25
+
+        # 2️⃣ Whisper
+        result = whisper_model.transcribe(wav_path)
+
+        jobs[job_id]["percent"] = 60
+
+        # 3️⃣ Crear subtítulos simples (TXT → placeholder)
+        subs_path = os.path.join(STORAGE_TMP, f"{job_id}.txt")
+        with open(subs_path, "w", encoding="utf-8") as f:
+            f.write(result["text"])
+
+        jobs[job_id]["percent"] = 80
+
+        # 4️⃣ Copiar vídeo final (sin quemar aún)
+        output_path = os.path.join(STORAGE_OUTPUT, f"{job_id}.mp4")
+        shutil.copy(input_path, output_path)
+
+        jobs[job_id]["output"] = output_path
+        jobs[job_id]["percent"] = 100
+        jobs[job_id]["status"] = "done"
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["percent"] = 0
+
+
+# ---------------- ENDPOINTS ----------------
+
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), preset_id: str = ""):
+async def upload(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
-    input_path = os.path.join(INPUT, f"{job_id}.mp4")
+    input_path = os.path.join(STORAGE_INPUT, f"{job_id}.mp4")
 
     with open(input_path, "wb") as f:
-        f.write(await file.read())
+        shutil.copyfileobj(file.file, f)
 
     jobs[job_id] = {
-        "status": "processing",
-        "input": input_path,
-        "preset": presets.get(preset_id, {})
+        "status": "queued",
+        "percent": 0,
+        "output": None,
     }
 
-    threading.Thread(target=process_job, args=(job_id,)).start()
+    thread = threading.Thread(
+        target=process_job,
+        args=(job_id, input_path),
+        daemon=True,
+    )
+    thread.start()
+
     return {"job_id": job_id}
 
-# ---------- STATUS ----------
+
 @app.get("/status/{job_id}")
 def status(job_id: str):
     job = jobs.get(job_id)
-
     if not job:
-        return {"status": "processing", "percent": 0}
+        return JSONResponse({"status": "error", "percent": 0}, status_code=404)
 
     return {
-        "status": job.get("status", "processing"),
+        "status": job["status"],
         "percent": job.get("percent", 0),
     }
 
 
-# ---------- DOWNLOAD ----------
 @app.get("/download/{job_id}")
 def download(job_id: str):
-    path = os.path.join(OUTPUT, f"{job_id}.mp4")
-    if not os.path.exists(path):
-        return JSONResponse({"error": "file not ready"}, status_code=404)
-    return FileResponse(path, media_type="video/mp4", filename="clip.mp4")
+    job = jobs.get(job_id)
+    if not job or job["status"] != "done":
+        return JSONResponse({"error": "Not ready"}, status_code=400)
+
+    return FileResponse(job["output"], media_type="video/mp4")
+
 
 # ---------- PIPELINE ----------
 def process_job(job_id: str):
@@ -96,15 +149,7 @@ def process_job(job_id: str):
             "-t", "25",
             "-ac", "1", "-ar", "16000", wav
         ], check=True)
-
-        # -------- WHISPER --------
-        subprocess.run([
-            "whisper", wav,
-            "--model", "base",
-            "--word_timestamps", "True",
-            "--output_format", "json",
-            "--output_dir", TMP,
-        ], check=True)
+        
 
         # -------- LOAD WORDS --------
         with open(json_out, "r", encoding="utf-8") as f:
