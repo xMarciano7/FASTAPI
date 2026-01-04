@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-torch
+requests
 ffmpeg-python
 python-multipart
 
