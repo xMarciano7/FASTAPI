@@ -1,223 +1,161 @@
 import os
 import uuid
+import json
+import time
 import shutil
-import threading
+import requests
 import subprocess
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse
-import whisper
+from fastapi.responses import JSONResponse, FileResponse
 
-# ---------------- CONFIG ----------------
-print("### THIS IS THE NEW MAIN.PY ###")
+# ============================================================
+# CONFIG
+# ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 STORAGE_INPUT = os.path.join(BASE_DIR, "storage", "input")
-STORAGE_TMP = os.path.join(BASE_DIR, "storage", "tmp")
 STORAGE_OUTPUT = os.path.join(BASE_DIR, "storage", "output")
+STORAGE_TMP = os.path.join(BASE_DIR, "storage", "tmp")
 
 os.makedirs(STORAGE_INPUT, exist_ok=True)
-os.makedirs(STORAGE_TMP, exist_ok=True)
 os.makedirs(STORAGE_OUTPUT, exist_ok=True)
+os.makedirs(STORAGE_TMP, exist_ok=True)
 
-# ---------------- APP ----------------
+RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
+RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 
-app = FastAPI()
+if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT_ID:
+    raise RuntimeError("RUNPOD_API_KEY o RUNPOD_ENDPOINT_ID no definidos")
 
-# ---------------- STATE ----------------
+RUNPOD_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run"
+RUNPOD_HEADERS = {
+    "Authorization": f"Bearer {RUNPOD_API_KEY}",
+    "Content-Type": "application/json",
+}
 
-jobs = {}
+# ============================================================
+# FASTAPI
+# ============================================================
 
-# ---------------- WHISPER (GLOBAL) ----------------
-# IMPORTANTE: cargar UNA sola vez
-whisper_model = whisper.load_model("base")
+app = FastAPI(title="ClipFile Backend (RunPod Whisper)")
 
-# ---------------- WORKER ----------------
+# ============================================================
+# UTILS
+# ============================================================
 
-def process_job(job_id: str, input_path: str):
-    try:
-        jobs[job_id]["status"] = "processing"
-        jobs[job_id]["percent"] = 5
-
-        wav_path = os.path.join(STORAGE_TMP, f"{job_id}.wav")
-
-        # 1️⃣ Extraer audio
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                input_path,
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                wav_path,
-            ],
-            check=True,
-        )
-
-        jobs[job_id]["percent"] = 25
-
-        # 2️⃣ Whisper
-        result = whisper_model.transcribe(wav_path)
-
-        jobs[job_id]["percent"] = 60
-
-        # 3️⃣ Crear subtítulos simples (TXT → placeholder)
-        subs_path = os.path.join(STORAGE_TMP, f"{job_id}.txt")
-        with open(subs_path, "w", encoding="utf-8") as f:
-            f.write(result["text"])
-
-        jobs[job_id]["percent"] = 80
-
-        # 4️⃣ Copiar vídeo final (sin quemar aún)
-        output_path = os.path.join(STORAGE_OUTPUT, f"{job_id}.mp4")
-        shutil.copy(input_path, output_path)
-
-        jobs[job_id]["output"] = output_path
-        jobs[job_id]["percent"] = 100
-        jobs[job_id]["status"] = "done"
-
-    except Exception as e:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
-        jobs[job_id]["percent"] = 0
+def write_progress(job_id: str, percent: int):
+    path = os.path.join(STORAGE_TMP, f"{job_id}.progress.json")
+    with open(path, "w") as f:
+        json.dump({"percent": percent}, f)
 
 
-# ---------------- ENDPOINTS ----------------
+def runpod_transcribe(audio_path: str) -> str:
+    """
+    Envía el audio a RunPod Whisper y devuelve el texto.
+    """
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    payload = {
+        "input": {
+            "audio": audio_bytes.hex(),
+            "task": "transcribe",
+            "language": "auto"
+        }
+    }
+
+    r = requests.post(RUNPOD_URL, headers=RUNPOD_HEADERS, json=payload, timeout=600)
+    r.raise_for_status()
+
+    data = r.json()
+
+    if "error" in data:
+        raise RuntimeError(str(data["error"]))
+
+    output = data.get("output")
+    if not output:
+        raise RuntimeError("Respuesta vacía de RunPod")
+
+    return output.get("text", "")
+
+
+# ============================================================
+# ENDPOINTS
+# ============================================================
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload_video(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
     input_path = os.path.join(STORAGE_INPUT, f"{job_id}.mp4")
 
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    jobs[job_id] = {
-        "status": "queued",
-        "percent": 0,
-        "output": None,
-    }
-
-    thread = threading.Thread(
-        target=process_job,
-        args=(job_id, input_path),
-        daemon=True,
-    )
-    thread.start()
+    write_progress(job_id, 5)
 
     return {"job_id": job_id}
 
 
-@app.get("/status/{job_id}")
-def status(job_id: str):
-    job = jobs.get(job_id)
-    if not job:
-        return JSONResponse({"status": "error", "percent": 0}, status_code=404)
+@app.get("/progress/{job_id}")
+def progress(job_id: str):
+    path = os.path.join(STORAGE_TMP, f"{job_id}.progress.json")
+    if not os.path.exists(path):
+        return {"percent": 0}
+    with open(path) as f:
+        return json.load(f)
 
-    return {
-        "status": job["status"],
-        "percent": job.get("percent", 0),
-    }
+
+@app.post("/process/{job_id}")
+def process(job_id: str):
+    input_video = os.path.join(STORAGE_INPUT, f"{job_id}.mp4")
+    if not os.path.exists(input_video):
+        return JSONResponse({"error": "video no encontrado"}, status_code=404)
+
+    write_progress(job_id, 10)
+
+    # Extraer audio
+    audio_path = os.path.join(STORAGE_TMP, f"{job_id}.wav")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", input_video,
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            audio_path,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    write_progress(job_id, 30)
+
+    # Transcribir con RunPod
+    text = runpod_transcribe(audio_path)
+
+    write_progress(job_id, 70)
+
+    # Guardar texto
+    txt_path = os.path.join(STORAGE_OUTPUT, f"{job_id}.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    write_progress(job_id, 100)
+
+    return {"status": "ok", "job_id": job_id}
 
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
-    job = jobs.get(job_id)
-    if not job or job["status"] != "done":
-        return JSONResponse({"error": "Not ready"}, status_code=400)
+    path = os.path.join(STORAGE_OUTPUT, f"{job_id}.txt")
+    if not os.path.exists(path):
+        return JSONResponse({"error": "archivo no listo"}, status_code=404)
+    return FileResponse(path, media_type="text/plain", filename=f"{job_id}.txt")
 
-    return FileResponse(job["output"], media_type="video/mp4")
 
-
-# ---------- PIPELINE ----------
-def process_job(job_id: str):
-    try:
-        job = jobs[job_id]
-        preset = job["preset"]
-        video = job["input"]
-
-        wav = os.path.join(TMP, f"{job_id}.wav")
-        json_out = os.path.join(TMP, f"{job_id}.json")
-        ass = os.path.join(TMP, f"{job_id}.ass")
-        out = os.path.join(OUTPUT, f"{job_id}.mp4")
-
-        # -------- AUDIO --------
-        subprocess.run([
-            "ffmpeg", "-y", "-i", video,
-            "-t", "25",
-            "-ac", "1", "-ar", "16000", wav
-        ], check=True)
-        
-
-        # -------- LOAD WORDS --------
-        with open(json_out, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        words = []
-        for seg in data["segments"]:
-            for w in seg["words"]:
-                words.append({
-                    "text": w["word"].strip(),
-                    "start": w["start"],
-                    "end": w["end"]
-                })
-
-        # -------- PRESET VALUES --------
-        font = preset.get("font", "Poppins ExtraBold")
-        size = preset.get("size", 130)
-        color = preset.get("primary_color", "&H0000FFFF")
-        outline = preset.get("outline", 6)
-        align = preset.get("alignment", 2)
-        margin_v = preset.get("margin_v", 350)
-        max_words = preset.get("max_words", 2)
-
-        # -------- ASS HEADER --------
-        with open(ass, "w", encoding="utf-8") as f:
-            f.write(f"""
-[Script Info]
-PlayResX: 1080
-PlayResY: 1920
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{size},{color},{color},&H00000000,&H00000000,1,0,1,{outline},0,{align},50,50,{margin_v},1
-
-[Events]
-Format: Layer, Start, End, Style, Text
-""")
-
-            # -------- WORD GROUPING --------
-            i = 0
-            while i < len(words):
-                group = words[i:i + max_words]
-                text = " ".join(w["text"] for w in group)
-                start = group[0]["start"]
-                end = group[-1]["end"]
-
-                f.write(
-                    f"Dialogue: 0,{sec(start)},{sec(end)},Default,,0,0,0,,{text}\n"
-                )
-                i += max_words
-
-        # -------- BURN SUBS --------
-        subprocess.run([
-            "ffmpeg", "-y", "-i", video,
-            "-t", "25",
-            "-vf", f"ass={ass}",
-            out
-        ], check=True)
-
-        jobs[job_id]["status"] = "done"
-
-    except Exception as e:
-        jobs[job_id]["status"] = "error"
-        print("ERROR:", e)
-
-def sec(t):
-    h = int(t // 3600)
-    m = int((t % 3600) // 60)
-    s = t % 60
-    return f"{h}:{m:02d}:{s:05.2f}"
+@app.get("/")
+def root():
+    return {"status": "ok", "backend": "runpod-whisper"}
